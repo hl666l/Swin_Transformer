@@ -4,7 +4,9 @@ import torch.utils.checkpoint as checkpoint
 from timm.models.layers import DropPath, to_2tuple, trunc_normal_
 
 """
-PatchEmbed --->PatchMerging--->
+PatchEmbed --->PatchMerging--->LN --->W-MSA(窗口自注意力机制，将一张图片分成几个等大小的窗口，每个窗口内进行注意力机制) 
+
+---> LN ---> MLP
 
 """
 
@@ -110,27 +112,60 @@ class PatchMerging(nn.Module):
 class WindowAttention(nn.Module):
     # 实现W-MSA，SW-MSA
     def __init__(self, dim, window_size, num_heads, qkv_bias=True, qk_scale=None, atten_drop=0., proj_drop=0.):
+        """
+        :param dim: 输入通道的数量
+        :param window_size: window的长和宽
+        :param num_heads: heads的数量
+        :param qkv_bias: 如果为True，则向query, key, value添加一个可学习的偏差。默认值: True
+        :param qk_scale:如果设置，覆盖head_dim ** -0.5的默认qk值
+        :param atten_drop: attention weight丢弃率，默认: 0.0
+        :param proj_drop: output的丢弃率. 默认:: 0.0
+        """
         super(WindowAttention, self).__init__()
 
         self.dim = dim
-        self.window_size = window_size
+        self.window_size = window_size  # MH，MW
         self.num_heads = num_heads
         head_dim = dim // num_heads
         self.scale = qk_scale or head_dim ** -0.5
 
+        # 定义相对位置偏差的参数列表（2*Mh-1 * 2*Mw-1, num_heads）
         self.relative_positive_bias_table = nn.Parameter(
             torch.zeros((2 * window_size[0] - 1) * (2 * window_size[1] - 1), num_heads)
         )
+        # 获取窗口内每个token的成对相对位置索引
+        # 获取feature map 的长宽，然后生成 长宽的每一个坐标
+        """
+        获取窗口内每个token的成对相对位置索引
+        获取feature map 的长宽，然后生成 长宽的每一个坐标
+        coords_h,coords_w两个tensor中包含图像内的每个像素的x,y坐标
+        """
         coords_h = torch.arange(self.window_size[0])
         coords_w = torch.arange(self.window_size[1])
+        """
+        将之前获取的x,y坐标拼接成一个矩阵，这样就形成了一张图片所有像素的位置矩阵 [2, h, w]
+        """
         coords = torch.stack(torch.meshgrid([coords_h, coords_w]))
-        coords_flatten = torch.flatten(coords, 1)
+        coords_flatten = torch.flatten(coords, 1)  # 沿h这个维度进行展平，[2,h*w] 绝对位置索引
+        # [2, Mh*Mw, 1] - [2, 1, Mh*Mw]
+        # [2, Mh*Mw, Mh*Mw] 得到相对位置索引的矩阵。 以每一个像素作为参考点 - 当前feature map/window当中所有的像素点绝对位置索引 = 得到相对位置索引的矩阵
+        # coords_flatten[:, :, None] 按w维度 每一行的元素复制
+        # coords_flatten[:, None, :] 按h维度 每一行元素整体复制
+        """
+         [:, :, None] None表示对数组维度的扩充，为什么要扩充？
+         [2, Mh*Mw, 1] - [2, 1, Mh*Mw]
+         [2, Mh*Mw, Mh*Mw] 得到相对位置索引的矩阵。 
+         以每一个像素作为参考点 - 当前feature map/window当中所有的像素点绝对位置索引 = 得到相对位置索引的矩阵
+        """
         relative_coords = coords_flatten[:, :, None] - coords_flatten[:, None, :]
+        # permute: 将窗口按每个元素求得的相对位置索引组成矩阵
         relative_coords = relative_coords.permute(1, 2, 0).contiguous()
+        # 二元索引-->一元索引
         relative_coords[:, :, 0] += self.window_size[0] - 1
         relative_coords[:, :, 1] += self.window_size[1] - 1
         relative_coords[:, :, 0] *= 2 * self.window_size[1] - 1
-        relative_position_index = relative_coords.sum(-1)
+        relative_position_index = relative_coords.sum(-1)  # [h*w, h*w]
+        # 放到模型缓存中
         self.register_buffer("relative_position_index", relative_position_index)
 
         self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
@@ -147,11 +182,18 @@ class WindowAttention(nn.Module):
         :param mask:
         :return:
         """
+        # 解析输入维度[batch_size * num_windows, mh*mw, total_embed_dim]
         B_, N, C = x.shape
+        #
         qkv = self.qkv(x).reshape(B_, N, 3, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
         q, k, v = qkv[0], qkv[1], qkv[2]
         q = q * self.scale
         attn = (q @ k.transpose(-2, -1))
+
+        x = (attn @ v).transformer(1, 2).reshape(B_, N, C)
+        x = self.proj(x)
+        x = self.proj_drop(x)
+        return x
 
 
 class SwinTransformerBlock():

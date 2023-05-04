@@ -196,5 +196,78 @@ class WindowAttention(nn.Module):
         return x
 
 
-class SwinTransformerBlock():
+class MLP():
     pass
+
+
+class window_partition():
+    pass
+
+
+class SwinTransformerBlock(nn.Module):
+    def __init__(self, dim, num_heads, window_size=7, shift_size=0., mlp_ratio=4, qkv_bias=True, drop=0., atten_drop=0.,
+                 drop_path=0, act_layer=nn.GLU, norm_layer=nn.LayerNorm):
+        super(SwinTransformerBlock, self).__init__()
+        self.dim = dim
+        self.num_heads = num_heads
+        self.window_size = window_size
+        self.shift_size = shift_size
+        self.mlp_ratio = mlp_ratio
+        self.norml = norm_layer(dim)
+        self.attn = WindowAttention(
+            dim=dim, window_size=(self.window_size, self.window_size), num_heads=num_heads,
+            qkv_bias=qkv_bias, atten_drop=atten_drop, proj_drop=drop
+        )
+        self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()
+        self.norm2 = norm_layer(dim)
+        mlp_hidden_dim = (int(dim * mlp_ratio))
+        self.mlp = MLP(in_features=dim, hidden_features=mlp_hidden_dim, act=act_layer, drop=drop)
+        if self.shift_size > 0:
+            H, W = self.input_resolution
+            img_mask = torch.zeros(1, H, W, 1)
+            h_slices = (slice(0, -self.window_size),
+                        slice(-self.window_size, -self.shift_size),
+                        slice(-self.shift_size, None)
+                        )
+            w_slices = (slice(0, -self.window_size),
+                        slice(-self.window_size, -self.window_size),
+                        slice(-self.shift_size, None)
+                        )
+            cnt = 0
+            for h in h_slices:
+                for w in w_slices:
+                    img_mask[:, h, w, :] = cnt
+                    cnt += 1
+
+            mask_windows = window_partition(img_mask, self.window_size)
+            mask_windows = mask_windows.view(-1, self.window_size * self.window_size)
+            attn_mask = mask_windows.unsqueeze(1) - mask_windows.unsqueeze(2)
+            attn_mask = attn_mask.masked_fill(attn_mask != 0, float(-100.0)).masked_fill(attn_mask == 0, float(0.0))
+        else:
+            attn_mask = None
+            self.register_buffer('attn_mask', attn_mask)
+
+    def forward(self, x):
+        H, W = self.input_resolution
+        B, L, C = x.shape
+        assert L == H * W, "input feature has wrong size"
+        shortcut = x
+        x = self.norml(x)
+        x = x.view(B, H, W, C)
+        if self.shift_size > 0:
+            shifted_size = torch.roll(x, shifts=(-self.shift_size, -self.shift_size), dims=(1, 2))
+        else:
+            shifted_x = x
+
+        shifted_x = self.attn(shifted_x, H, W, mask=self.attn_mask)
+        if self.shift_size > 0:
+            x = torch.roll(shifted_x, shifts=(self.shift_size, self.shift_size), dims=(1, 2))
+        else:
+            x = shifted_x
+
+        x = x.view(B, H * W, C)
+        x = shortcut + self.drop_path(x)
+        x = x + self.drop_path(self.norm2(x))
+
+        return x
+

@@ -200,23 +200,44 @@ class MLP():
     pass
 
 
-class window_partition():
+class WindowProcess:
     pass
 
 
+class WindowProcessReverse:
+    pass
+
+
+def window_reverse():
+    pass
+
+
+def window_partition(x, window_size: int):
+    B, H, W, C = x.shape
+    x = x.view(B, H // window_size, window_size, W // window_size, window_size, C)
+    windows = x.permute(0, 1, 3, 2, 4, 5).contiguous().view(-1, window_size, window_size, C)
+    return windows
+
+
 class SwinTransformerBlock(nn.Module):
-    def __init__(self, dim, num_heads, window_size=7, shift_size=0., mlp_ratio=4, qkv_bias=True, drop=0., atten_drop=0.,
-                 drop_path=0, act_layer=nn.GLU, norm_layer=nn.LayerNorm):
+    def __init__(self, dim, input_resolution, num_heads, window_size=7, shift_size=0, mlp_ratio=4., qkv_bias=True,
+                 qk_scale=None, drop=0., atten_drop=0.,
+                 drop_path=0., act_layer=nn.GELU, norm_layer=nn.LayerNorm, fused_window_process=False):
         super(SwinTransformerBlock, self).__init__()
-        self.dim = dim
-        self.num_heads = num_heads
+        self.dim = dim  # 输入维度
+        self.input_resolution = input_resolution
+        self.num_heads = num_heads  #
         self.window_size = window_size
         self.shift_size = shift_size
         self.mlp_ratio = mlp_ratio
-        self.norml = norm_layer(dim)
+        if min(self.input_resolution) <= self.window_size:
+            self.shift_size = 0
+            self.window_size = min(self.input_resolution)
+        assert 0 <= self.shift_size < self.window_size, "shift_size must in 0-window_size"
+        self.norm1 = norm_layer(dim)
         self.attn = WindowAttention(
             dim=dim, window_size=(self.window_size, self.window_size), num_heads=num_heads,
-            qkv_bias=qkv_bias, atten_drop=atten_drop, proj_drop=drop
+            qkv_bias=qkv_bias, qk_scale=qk_scale, atten_drop=atten_drop, proj_drop=drop
         )
         self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()
         self.norm2 = norm_layer(dim)
@@ -224,13 +245,13 @@ class SwinTransformerBlock(nn.Module):
         self.mlp = MLP(in_features=dim, hidden_features=mlp_hidden_dim, act=act_layer, drop=drop)
         if self.shift_size > 0:
             H, W = self.input_resolution
-            img_mask = torch.zeros(1, H, W, 1)
+            img_mask = torch.zeros((1, H, W, 1))
             h_slices = (slice(0, -self.window_size),
                         slice(-self.window_size, -self.shift_size),
                         slice(-self.shift_size, None)
                         )
             w_slices = (slice(0, -self.window_size),
-                        slice(-self.window_size, -self.window_size),
+                        slice(-self.window_size, -self.shift_size),
                         slice(-self.shift_size, None)
                         )
             cnt = 0
@@ -245,29 +266,62 @@ class SwinTransformerBlock(nn.Module):
             attn_mask = attn_mask.masked_fill(attn_mask != 0, float(-100.0)).masked_fill(attn_mask == 0, float(0.0))
         else:
             attn_mask = None
-            self.register_buffer('attn_mask', attn_mask)
+        self.register_buffer('attn_mask', attn_mask)
+        self.fused_window_process = fused_window_process
 
     def forward(self, x):
         H, W = self.input_resolution
         B, L, C = x.shape
         assert L == H * W, "input feature has wrong size"
         shortcut = x
-        x = self.norml(x)
+        x = self.norm1(x)
         x = x.view(B, H, W, C)
+
         if self.shift_size > 0:
-            shifted_size = torch.roll(x, shifts=(-self.shift_size, -self.shift_size), dims=(1, 2))
+            if not self.fused_window_process:
+                shifted_x = torch.roll(x, shifts=(-self.shift_size, -self.shift_size), dims=(1, 2))
+                x_windows = window_partition(shifted_x, self.window_size)
+            else:
+                x_windows = WindowProcess.apply(x, B, H, W, C, -self.shift_size, self.window_size)
         else:
             shifted_x = x
+            x_windows = window_partition(shifted_x, self.window_size)
+        x_windows = x_windows.view(-1, self.window_size * self.window_size, C)
+        attn_windows = self.attn(x_windows, mask=self.attn_mask)
 
-        shifted_x = self.attn(shifted_x, H, W, mask=self.attn_mask)
+        attn_windows = attn_windows.view(-1, self.window_size, self.window_size, C)
+
         if self.shift_size > 0:
-            x = torch.roll(shifted_x, shifts=(self.shift_size, self.shift_size), dims=(1, 2))
+            if not self.fused_window_process:
+                shifted_x = window_reverse(attn_windows, self.window_size, H, W)
+                x = torch.roll(shifted_x, shifts=(self.shift_size, self.shift_size), dims=(1, 2))
+            else:
+                x = WindowProcessReverse.apply(attn_windows, B, H, W, C, self.shift_size, self.fused_window_process)
         else:
+            shifted_x = window_reverse(attn_windows, self.window_size, H, W)
             x = shifted_x
 
         x = x.view(B, H * W, C)
         x = shortcut + self.drop_path(x)
-        x = x + self.drop_path(self.norm2(x))
 
+        x = x + self.drop_path(self.mlp(self.norm2(x)))
         return x
+
+    def extra_repr(self) -> str:
+        return f"dim={self.dim}, input_resolution={self.input_resolution}, num_heads={self.num_heads}, " \
+               f"window_size={self.window_size}, shift_size={self.shift_size}, mlp_ratio={self.mlp_ratio}"
+
+    def flops(self):
+        flops = 0
+        H, W = self.input_resolution
+        # norm1
+        flops += self.dim * H * W
+        # W-MSA/SW-MSA
+        nW = H * W / self.window_size / self.window_size
+        flops += nW * self.attn.flops(self.window_size * self.window_size)
+        # mlp
+        flops += 2 * H * W * self.dim * self.dim * self.mlp_ratio
+        # norm2
+        flops += self.dim * H * W
+        return flops
 
